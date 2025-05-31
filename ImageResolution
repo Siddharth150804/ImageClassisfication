@@ -1,0 +1,128 @@
+# 1. Install and import necessary libraries
+!pip install tensorflow matplotlib
+
+import tensorflow as tf
+import matplotlib.pyplot as plt
+import os
+import random
+
+# 2. Load CIFAR-10 and preprocess into LR/HR pairs
+def load_and_preprocess(example, hr_size=(96,96)):
+    img = tf.image.convert_image_dtype(example['image'], tf.float32)  # [0,1]
+    hr  = tf.image.resize(img, hr_size)
+    lr  = tf.image.resize(hr, (hr_size[0]//4, hr_size[1]//4))
+    return lr, hr
+
+ds = tfds.load('cifar10', split='train', shuffle_files=True)
+ds = ds.shuffle(50_000).map(load_and_preprocess, num_parallel_calls=tf.data.AUTOTUNE)
+
+BATCH = 16
+SUBSET = 10000  # You can set to None if you want full 50,000 images
+if SUBSET:
+    ds = ds.take(SUBSET)
+
+train_dataset = ds.batch(BATCH).prefetch(tf.data.AUTOTUNE)
+print("✅ Batches ready:", train_dataset)
+
+# 3. Build Generator and Discriminator
+from tensorflow.keras import layers, models, losses, optimizers
+
+def build_generator():
+    inp = layers.Input((24,24,3))
+    x = layers.Conv2D(64,3,padding='same',activation='relu')(inp)
+    x = layers.UpSampling2D()(x)
+    x = layers.Conv2D(64,3,padding='same',activation='relu')(x)
+    x = layers.UpSampling2D()(x)
+    x = layers.Conv2D(64,3,padding='same',activation='relu')(x)
+    out = layers.Conv2D(3,3,padding='same',activation='sigmoid')(x)
+    return models.Model(inp,out,name='generator')
+
+def build_discriminator():
+    inp = layers.Input((96,96,3))
+    x = layers.Conv2D(64,3,strides=2,padding='same')(inp)
+    x = layers.LeakyReLU(0.2)(x)
+    for f in [128,256,512]:
+        x = layers.Conv2D(f,3,strides=2,padding='same')(x)
+        x = layers.BatchNormalization()(x)
+        x = layers.LeakyReLU(0.2)(x)
+    x = layers.Flatten()(x)
+    x = layers.Dense(1024)(x)
+    x = layers.LeakyReLU(0.2)(x)
+    out = layers.Dense(1,activation='sigmoid')(x)
+    return models.Model(inp,out,name='discriminator')
+
+generator     = build_generator()
+discriminator = build_discriminator()
+
+bce      = losses.BinaryCrossentropy(from_logits=False)
+gen_opt  = optimizers.Adam(1e-4)
+disc_opt = optimizers.Adam(1e-4)
+
+# 4. Setup Checkpoints
+checkpoint_dir = "/content/checkpoints"
+checkpoint_prefix = os.path.join(checkpoint_dir, "ckpt")
+checkpoint = tf.train.Checkpoint(generator=generator,
+                                  discriminator=discriminator,
+                                  gen_opt=gen_opt,
+                                  disc_opt=disc_opt)
+checkpoint_manager = tf.train.CheckpointManager(checkpoint, checkpoint_dir, max_to_keep=3)
+
+# Restore latest checkpoint if exists
+checkpoint.restore(checkpoint_manager.latest_checkpoint)
+if checkpoint_manager.latest_checkpoint:
+    print(f"✅ Restored from {checkpoint_manager.latest_checkpoint}")
+else:
+    print("⚡ Starting training from scratch.")
+
+# 5. Define the training step
+@tf.function
+def train_step(lr, hr):
+    with tf.GradientTape() as gt, tf.GradientTape() as dt:
+        fake = generator(lr, training=True)
+        real_out = discriminator(hr, training=True)
+        fake_out = discriminator(fake, training=True)
+
+        adv_loss  = bce(tf.ones_like(fake_out), fake_out)
+        pix_loss  = tf.reduce_mean(tf.square(hr - fake))
+        gen_loss  = pix_loss + 1e-3 * adv_loss
+
+        real_loss = bce(tf.ones_like(real_out), real_out)
+        fake_loss = bce(tf.zeros_like(fake_out), fake_out)
+        disc_loss = (real_loss + fake_loss) * 0.5
+
+    grads_g = gt.gradient(gen_loss, generator.trainable_variables)
+    grads_d = dt.gradient(disc_loss, discriminator.trainable_variables)
+    gen_opt.apply_gradients(zip(grads_g, generator.trainable_variables))
+    disc_opt.apply_gradients(zip(grads_d, discriminator.trainable_variables))
+    return gen_loss, disc_loss
+
+# 6. Training Loop
+EPOCHS = 5
+steps_per_epoch = len(train_dataset)
+
+for epoch in range(1, EPOCHS + 1):
+    print(f"\n🚀 Epoch {epoch}/{EPOCHS} started.")
+
+    for step, (lr_batch, hr_batch) in enumerate(train_dataset.take(steps_per_epoch)):
+        gen_loss, disc_loss = train_step(lr_batch, hr_batch)
+
+        if step % 50 == 0:
+            print(f"Step {step}/{steps_per_epoch} - gen_loss={gen_loss:.4f} disc_loss={disc_loss:.4f}")
+
+    # Save checkpoint after each epoch
+    checkpoint_manager.save()
+    print(f"✅ Checkpoint saved at epoch {epoch}")
+
+    # Visualize some sample images
+    lr0, hr0 = next(iter(train_dataset))
+    sr0 = generator(lr0, training=False)
+    plt.figure(figsize=(12,4))
+    for i, img in enumerate([lr0, sr0, hr0]):
+        plt.subplot(1,3,i+1)
+        plt.title(['LR','SR','HR'][i])
+        plt.imshow(tf.clip_by_value(img[0],0,1))
+        plt.axis('off')
+    plt.show()
+
+print("\n✅ Training Complete!")
+
